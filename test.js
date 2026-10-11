@@ -5490,6 +5490,49 @@ test('pMap - maps an async source whose `next()` returns thenables that are not 
 	t.deepEqual(await pMap(source, value => value * 2, {concurrency: 2}), [0, 2, 4]);
 });
 
+for (const [name, map] of [
+	['pMap', source => pMap(source, value => value, {concurrency: 1})],
+	['pMapSettled', source => pMapSettled(source, value => value, {concurrency: 1})],
+	['pMapIterable ordered', source => collectAsyncIterable(pMapIterable(source, value => value, {concurrency: 1}))],
+	['pMapIterable unordered', source => collectAsyncIterable(pMapIterable(source, value => value, {concurrency: 1, preserveOrder: false}))],
+]) {
+	for (const getter of [false, true]) {
+		test(`${name} - assimilates a cold thenable pull once${getter ? ' with a then getter' : ''}`, async t => {
+			const values = [1, 2, 3];
+			let nextCalls = 0;
+			let thenCalls = 0;
+			const source = {
+				[Symbol.asyncIterator]() {
+					return {
+						next() {
+							nextCalls++;
+							const then = resolve => {
+								thenCalls++;
+								resolve(values.length > 0 ? {done: false, value: values.shift()} : {done: true});
+							};
+
+							if (!getter) {
+								return {then}; // eslint-disable-line unicorn/no-thenable
+							}
+
+							let reads = 0;
+							return {
+								get then() { // eslint-disable-line unicorn/no-thenable
+									t.is(++reads, 1, 'read then once for each pull');
+									return then;
+								},
+							};
+						},
+					};
+				},
+			};
+			const result = await map(source);
+			t.deepEqual(result, name === 'pMapSettled' ? [fulfilled(1), fulfilled(2), fulfilled(3)] : [1, 2, 3]);
+			t.is(thenCalls, nextCalls);
+		});
+	}
+}
+
 test('pMap - rejects instead of hanging when the source `next()` returns something that is not an object', async t => {
 	for (const result of [undefined, null]) {
 		const source = {

@@ -76,7 +76,7 @@ async function mapConcurrently(
 		const pendingIndexes = new Set();
 		let doneIndex = Number.POSITIVE_INFINITY;
 		let currentIndex = 0;
-		const iterator = getIterator(iterable);
+		const {iterator, isAsync} = getIterator(iterable);
 
 		const signalListener = () => {
 			reject(signal.reason);
@@ -114,7 +114,7 @@ async function mapConcurrently(
 			signal.addEventListener('abort', signalListener, {once: true});
 		}
 
-		const pull = createPuller(iterator);
+		const pull = createPuller(iterator, isAsync);
 
 		// Settle only once the source is done, or a mapper stopped, and every earlier pull and mapper has finished. A pull before the `done` or the stop can still produce an element, while pulls after it do not affect the result.
 		const settleIfFinished = () => {
@@ -305,7 +305,7 @@ export function pMapIterable(
 			let isDone = false;
 
 			const generator = (async function * () {
-				const iterator = getIterator(iterable);
+				const {iterator, isAsync} = getIterator(iterable);
 
 				// Results are consumed from the front with a moving `headIndex` instead of `shift()`.
 				// `shift()` moves every remaining entry, which is O(n) per element and made the whole
@@ -355,7 +355,7 @@ export function pMapIterable(
 					wake = undefined;
 				};
 
-				const pull = createPuller(iterator);
+				const pull = createPuller(iterator, isAsync);
 
 				function trySpawn() {
 					// Do not spawn once the consumer is gone, the source is done, or the stream ends at an earlier element. The pull would be wasted work, and for a one-shot source, like a queue, it takes an item nobody is going to ask for.
@@ -610,7 +610,8 @@ function getKeyedEntries(input) {
 
 // Take the async iterator when the input has both, like `for await` does.
 function getIterator(iterable) {
-	return iterable[Symbol.asyncIterator] === undefined ? iterable[Symbol.iterator]() : iterable[Symbol.asyncIterator]();
+	const isAsync = iterable[Symbol.asyncIterator] !== undefined;
+	return {iterator: isAsync ? iterable[Symbol.asyncIterator]() : iterable[Symbol.iterator](), isAsync};
 }
 
 // Close the source so it can release its resources, like `for await` does.
@@ -624,7 +625,7 @@ async function closeIterator(iterator) {
 // Pull the next item, and stop pulling once the source has reported `done`: a source like a queue
 // may block in `next()` after it is exhausted, which would hang the caller. `done` is final, like
 // `for await`, so anything the source produces after it is dropped.
-function createPuller(iterator) {
+function createPuller(iterator, isAsync) {
 	let isSourceDone = false;
 
 	// A sync iterable, like an array, answers right away, so `done` can be seen here. An async
@@ -643,19 +644,18 @@ function createPuller(iterator) {
 		const result = iterator.next();
 		markDone(result);
 
-		// A sync iterable, like an array, answers right away, so `done` has been read already and
-		// the result can go back untouched.
-		if (typeof result?.then !== 'function') {
+		// A sync iterator reports `done` immediately and needs no settlement observer.
+		if (!isAsync) {
 			return result;
 		}
 
-		// An async iterable settles later, so `done` is read off the pull once it does. That is a
-		// branch of its own, which leaves the caller awaiting the pull itself rather than a promise
-		// derived from it, so an async source does not pay an extra microtask per element. The
-		// rejection is handled here as well as by the caller, so a pull cannot escape as an
-		// unhandled rejection.
-		result.then(markDone, () => {});
+		// Assimilate a custom thenable once, so observing `done` and awaiting the pull do not
+		// subscribe to it separately. Reading `then` before normalization could also invoke a
+		// getter twice. Native promises keep their identity, and the caller awaits the normalized
+		// pull rather than this observer's derived promise, so there is no extra await hop.
+		const promise = Promise.resolve(result);
+		promise.then(markDone, () => {});
 
-		return result;
+		return promise;
 	};
 }
